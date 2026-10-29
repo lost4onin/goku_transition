@@ -6,7 +6,8 @@ How it works
 1. Captures an "empty room" photo (you step out of frame for a few seconds).
 2. Segments you from the background every frame (MediaPipe).
 3. Detects the gesture: index+middle finger up, ring+pinky folded, fingertips on forehead.
-4. On gesture: fades you out by blending the empty-room photo over your silhouette, with a quick flash.
+4. On gesture: you break into flickering vertical streaks (with a quick flash), then the feed
+   switches to the empty-room photo. Doing it again streaks you back in.
 5. Sends the result to a virtual camera -> pick "OBS Virtual Camera" in Teams/Zoom/Meet.
 
 Setup (Python 3.12)
@@ -20,6 +21,7 @@ Run
 Keys in the preview window:  b = re-capture background   q = quit
 """
 import argparse
+import functools
 import time
 
 import cv2
@@ -63,6 +65,47 @@ def detect_gesture(hand_res, face_res):
         if pose and near:
             return True
     return False
+
+
+@functools.lru_cache(maxsize=2)
+def pixel_grid(h, w):
+    """x and y coordinate of every pixel, as float32 maps for cv2.remap."""
+    return (np.tile(np.arange(w, dtype=np.float32), (h, 1)),
+            np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w)))
+
+
+def streak_frame(frame, background, mask, alpha, rng):
+    """Instant Transmission look: your body breaks into flickering vertical streaks.
+
+    mask is the 0..1 person mask; alpha is 1 = fully you, 0 = fully the empty-room photo.
+    """
+    h, w = mask.shape
+    burst = float(np.sin(np.pi * alpha))   # strongest halfway through the teleport
+
+    # random vertical strips, re-drawn every frame so they flicker
+    strip = np.searchsorted(np.cumsum(rng.integers(2, 10, size=w)), np.arange(w), side="right")
+    n = strip[-1] + 1
+    shown = (rng.random(n) < alpha)[strip]                          # fewer strips survive as alpha drops
+    shift = (rng.uniform(-1, 1, n) * 0.06 * h * burst)[strip]       # each strip slides up or down
+    glow = (rng.choice([-50, 0, 0, 0, 90], n) * burst).astype(np.int16)[strip]   # dark and bright lines
+
+    map_x, rows = pixel_grid(h, w)
+    map_y = rows + shift[None, :].astype(np.float32)
+    smear = 1 + 2 * int(15 * burst)                                 # vertical blur length
+    body = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    body = cv2.blur(body, (1, smear))
+
+    def per_column(v):   # one value per column -> full image, for OpenCV's saturating add
+        return np.ascontiguousarray(np.broadcast_to(v.astype(np.uint8)[None, :, None], body.shape))
+
+    body = cv2.subtract(cv2.add(body, per_column(np.maximum(glow, 0))), per_column(np.maximum(-glow, 0)))
+    body_m = cv2.remap(mask, map_x, map_y, cv2.INTER_LINEAR) * shown
+
+    # the room fades from live video to the photo; where you stood is always the photo
+    keep = np.maximum(mask, 1.0 - alpha)
+    out = cv2.blendLinear(frame, background, 1.0 - keep, keep)
+    out = cv2.blendLinear(out, body, 1.0 - body_m, body_m)
+    return out.astype(np.float32)
 
 
 def capture_background(cap, seconds=5):
@@ -111,6 +154,7 @@ def main():
     flash = 0.0
     held_since = None
     locked = False         # prevents re-triggering until the pose is released
+    rng = np.random.default_rng()
     last = time.time()
 
     with pyvirtualcam.Camera(width=w, height=h, fps=args.fps,
@@ -146,14 +190,16 @@ def main():
                 alpha = max(visible_target, alpha - step)
             flash = max(0.0, flash - dt / FLASH_SECONDS)
 
-            # --- person mask (slightly grown + feathered so no halo is left) ---
-            if alpha < 1.0:
+            # --- gone: send the empty-room photo; mid-teleport: streak effect ---
+            if alpha <= 0.0:
+                out = background.astype(np.float32)
+            elif alpha < 1.0:
+                # person mask (slightly grown + feathered so no halo is left)
                 m = seg.process(rgb).segmentation_mask
                 m = (m > 0.5).astype(np.uint8)
                 m = cv2.dilate(m, np.ones((9, 9), np.uint8), iterations=2)
                 m = cv2.GaussianBlur(m.astype(np.float32), (21, 21), 0)
-                m = (m * (1.0 - alpha))[..., None]          # 0 = keep you, 1 = fully replaced
-                out = frame * (1 - m) + background * m
+                out = streak_frame(frame, background, m, alpha, rng)
             else:
                 out = frame.astype(np.float32)
 
